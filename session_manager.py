@@ -1,21 +1,23 @@
 """
-Session manager for persistent Claude Code sessions.
+Session manager for Claude Code sessions using --resume.
 
-Each session is a persistent subprocess running:
-  claude --print --input-format stream-json --output-format stream-json --verbose
-         --session-id <uuid> --allowedTools <tools> --system-prompt <prompt>
-         --dangerously-skip-permissions
+Instead of keeping persistent subprocesses alive, each message spawns a fresh
+`claude -p` call with `--resume <session-id>`. Claude Code persists conversation
+state on disk automatically — no stdin/stdout juggling required.
 
-Sessions are identified by (user_id, session_name) and tracked by UUID.
-They expire after 12h of inactivity. The reaper runs every 5 minutes.
+First message in a session:
+  claude -p '<text>' --session-id <uuid> --system-prompt <prompt.md>
+          --output-format stream-json --dangerously-skip-permissions
+          --allowedTools <tools>
 
-stdin format (one JSON per line, written when user sends a message):
-  {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "..."}]}}
+Subsequent messages:
+  claude -p '<text>' --resume <uuid>
+          --output-format stream-json --dangerously-skip-permissions
+          --allowedTools <tools>
 
-stdout format: stream-json events (one JSON per line):
-  {"type": "system", "subtype": "init", ...}
-  {"type": "assistant", "message": {...}}
-  {"type": "result", "subtype": "success", ...}   <- turn complete
+stdout stream-json events (read line by line):
+  {"type": "assistant", "message": {"role": "assistant", "content": [...]}}
+  {"type": "result", "subtype": "success", "result": "...", "cost_usd": ...}
   {"type": "result", "subtype": "error_during_execution", ...}
 """
 
@@ -27,8 +29,6 @@ import time
 import uuid
 from pathlib import Path
 from typing import Optional
-
-import aiofiles
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +55,7 @@ Read ~/memory/people/julian-moncarz.md for full context on Julian, his goals, an
 ## Key memory paths
 - ~/memory/todo-julian.md — Julian's personal to-do list
 - ~/memory/todo-rob.md — Tasks for Rob (the AI system)
-- ~/memory/journal/ — Julian's journal entries
+- ~/memory/journal/ — Journal entries
 
 ## Available CLIs
 Read ~/memory/tools/cli.md for full CLI documentation. Key tools:
@@ -90,6 +90,7 @@ class Session:
         focus: str,
         system_prompt: str,
         exempt_from_reaper: bool = False,
+        started: bool = False,
     ):
         self.session_id = session_id
         self.user_id = user_id
@@ -99,9 +100,10 @@ class Session:
         self.system_prompt = system_prompt
         self.exempt_from_reaper = exempt_from_reaper
         self.last_activity = time.time()
-        self.proc: Optional[asyncio.subprocess.Process] = None
+        # Has Claude Code ever been called with --session-id for this session?
+        # If True, subsequent calls use --resume. If False, first call uses --session-id.
+        self.started = started
         self._lock = asyncio.Lock()
-        self._ready = asyncio.Event()
 
     def to_dict(self) -> dict:
         return {
@@ -113,6 +115,7 @@ class Session:
             "system_prompt": self.system_prompt,
             "exempt_from_reaper": self.exempt_from_reaper,
             "last_activity": self.last_activity,
+            "started": self.started,
         }
 
     @classmethod
@@ -125,6 +128,7 @@ class Session:
             focus=d.get("focus", ""),
             system_prompt=d["system_prompt"],
             exempt_from_reaper=d.get("exempt_from_reaper", False),
+            started=d.get("started", False),
         )
         s.last_activity = d.get("last_activity", time.time())
         return s
@@ -195,7 +199,7 @@ class SessionManager:
             chat_id=chat_id,
             session_id=session_id,
         )
-        # Save prompt to file
+        # Save prompt to file (used on first call)
         prompt_dir = SESSIONS_DIR / session_id
         prompt_dir.mkdir(parents=True, exist_ok=True)
         (prompt_dir / "prompt.md").write_text(system_prompt)
@@ -208,6 +212,7 @@ class SessionManager:
             focus=focus,
             system_prompt=system_prompt,
             exempt_from_reaper=exempt_from_reaper,
+            started=False,
         )
         self._sessions[session_id] = session
         self._name_index[(user_id, session_name)] = session_id
@@ -215,149 +220,142 @@ class SessionManager:
         logger.info("Created session %s (%s) for user %s", session_id, session_name, user_id)
         return session
 
-    async def kill_session(self, session: Session):
-        logger.info("Killing session %s (%s)", session.session_id, session.session_name)
-        if session.proc and session.proc.returncode is None:
-            try:
-                session.proc.stdin.close()
-                await asyncio.wait_for(session.proc.wait(), timeout=5)
-            except Exception:
-                try:
-                    session.proc.kill()
-                except Exception:
-                    pass
-        session.proc = None
+    def kill_session(self, session: Session):
+        """Remove a session from the registry (no process to terminate)."""
+        logger.info("Removing session %s (%s)", session.session_id, session.session_name)
 
     async def send_message(self, session: Session, text: str) -> str:
         """
-        Send a message to a session subprocess and collect the response.
-        Returns the raw stream-json output (for logging/debugging).
+        Send a message to a Claude Code session and collect the response.
 
-        The session subprocess handles actually sending the Telegram reply
-        via the tg CLI (as instructed in the system prompt).
+        Spawns a fresh `claude -p` subprocess with --resume (or --session-id on
+        first call). Returns the raw stream-json output for logging. The session
+        itself sends the Telegram reply via the tg CLI as instructed in its
+        system prompt.
         """
         async with session._lock:
             session.last_activity = time.time()
-            self._save_state()
 
-            # Ensure subprocess is running
-            if session.proc is None or session.proc.returncode is not None:
-                await self._start_proc(session)
+            # Build command
+            prompt_file = SESSIONS_DIR / session.session_id / "prompt.md"
 
-            # Write the user message to stdin
-            # Format: one JSON line per message turn
-            msg = json.dumps({
-                "type": "user",
-                "message": {
-                    "role": "user",
-                    "content": [{"type": "text", "text": text}]
-                }
-            }) + "\n"
+            if not session.started:
+                # First message: start a new session with the given UUID and system prompt
+                cmd = [
+                    "claude",
+                    "--print",
+                    "--session-id", session.session_id,
+                    "--system-prompt", str(prompt_file),
+                    "--output-format", "stream-json",
+                    "--allowedTools", ALLOWED_TOOLS,
+                    "--dangerously-skip-permissions",
+                    text,
+                ]
+            else:
+                # Subsequent messages: resume the existing session
+                cmd = [
+                    "claude",
+                    "--print",
+                    "--resume", session.session_id,
+                    "--output-format", "stream-json",
+                    "--allowedTools", ALLOWED_TOOLS,
+                    "--dangerously-skip-permissions",
+                    text,
+                ]
 
-            try:
-                session.proc.stdin.write(msg.encode())
-                await session.proc.stdin.drain()
-            except Exception as e:
-                logger.error("Error writing to session %s stdin: %s", session.session_id, e)
-                # Process died — restart next time
-                session.proc = None
-                return f"[session error: {e}]"
+            # Environment: inherit everything except ANTHROPIC_API_KEY
+            env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
 
-            # Read stream-json events until we see a 'result' event
+            logger.info(
+                "Sending to session %s (%s): %s",
+                session.session_id,
+                session.session_name,
+                text[:80],
+            )
+
             output_lines = []
             try:
-                while True:
-                    line = await asyncio.wait_for(
-                        session.proc.stdout.readline(),
-                        timeout=300,  # 5 min max for a response
-                    )
-                    if not line:
-                        logger.warning("Session %s stdout EOF", session.session_id)
-                        session.proc = None
-                        break
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env,
+                    cwd="/opt/rob-router",
+                )
 
-                    line_str = line.decode().strip()
-                    if not line_str:
-                        continue
+                # Mark as started so future calls use --resume
+                session.started = True
+                self._save_state()
 
-                    output_lines.append(line_str)
-
-                    try:
-                        event = json.loads(line_str)
-                    except json.JSONDecodeError:
-                        continue
-
-                    event_type = event.get("type")
-                    logger.debug("Session %s event: %s", session.session_id, event_type)
-
-                    # 'result' marks end of a turn
-                    if event_type == "result":
-                        subtype = event.get("subtype", "")
-                        if subtype == "error_during_execution":
-                            logger.error(
-                                "Session %s error: %s",
+                # Read stream-json events line by line until 'result'
+                try:
+                    while True:
+                        line = await asyncio.wait_for(
+                            proc.stdout.readline(),
+                            timeout=300,  # 5 min max per turn
+                        )
+                        if not line:
+                            logger.warning(
+                                "Session %s stdout EOF before result event",
                                 session.session_id,
-                                event.get("result", "unknown error")
                             )
-                        break
+                            break
 
-            except asyncio.TimeoutError:
-                logger.error("Session %s timed out waiting for response", session.session_id)
-                return "[timeout waiting for response]"
+                        line_str = line.decode().strip()
+                        if not line_str:
+                            continue
+
+                        output_lines.append(line_str)
+
+                        try:
+                            event = json.loads(line_str)
+                        except json.JSONDecodeError:
+                            continue
+
+                        event_type = event.get("type")
+                        logger.debug("Session %s event: %s", session.session_id, event_type)
+
+                        if event_type == "result":
+                            subtype = event.get("subtype", "")
+                            if subtype == "error_during_execution":
+                                logger.error(
+                                    "Session %s error: %s",
+                                    session.session_id,
+                                    event.get("result", "unknown error"),
+                                )
+                            # Drain remaining stdout (shouldn't be any, but clean up)
+                            break
+
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "Session %s timed out waiting for response",
+                        session.session_id,
+                    )
+                    proc.kill()
+                    return "[timeout waiting for response]"
+
+                # Wait for process to exit (it should have already)
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=10)
+                except asyncio.TimeoutError:
+                    proc.kill()
+
+                # Log any stderr
+                stderr_data = await proc.stderr.read()
+                if stderr_data:
+                    for stderr_line in stderr_data.decode().splitlines():
+                        if stderr_line.strip():
+                            logger.debug(
+                                "[%s stderr] %s", session.session_name, stderr_line
+                            )
+
+            except Exception as e:
+                logger.error(
+                    "Error running claude for session %s: %s", session.session_id, e
+                )
+                return f"[session error: {e}]"
 
             return "\n".join(output_lines)
-
-    async def _start_proc(self, session: Session):
-        """Start (or restart) the claude subprocess for this session."""
-        logger.info("Starting subprocess for session %s (%s)", session.session_id, session.session_name)
-
-        # Build command
-        cmd = [
-            "claude",
-            "--print",
-            "--input-format", "stream-json",
-            "--output-format", "stream-json",
-            "--verbose",
-            "--session-id", session.session_id,
-            "--allowedTools", ALLOWED_TOOLS,
-            "--system-prompt", session.system_prompt,
-            "--dangerously-skip-permissions",
-        ]
-
-        # Environment: inherit everything except ANTHROPIC_API_KEY
-        env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
-
-        try:
-            session.proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-                cwd="/opt/rob-router",
-            )
-            logger.info(
-                "Started session %s subprocess (pid=%d)",
-                session.session_id,
-                session.proc.pid,
-            )
-            # Drain stderr in background
-            asyncio.create_task(self._drain_stderr(session))
-        except Exception as e:
-            logger.error("Failed to start subprocess for session %s: %s", session.session_id, e)
-            session.proc = None
-            raise
-
-    async def _drain_stderr(self, session: Session):
-        """Read and log stderr from session subprocess."""
-        try:
-            while session.proc and session.proc.returncode is None:
-                line = await session.proc.stderr.readline()
-                if not line:
-                    break
-                logger.debug("[%s stderr] %s", session.session_name, line.decode().rstrip())
-        except Exception:
-            pass
 
     # ── Session description ────────────────────────────────────────────────
 
@@ -373,7 +371,7 @@ class SessionManager:
     # ── Reaper ────────────────────────────────────────────────────────────
 
     async def reaper_loop(self):
-        """Kill sessions inactive for more than SESSION_TTL. Runs every 5 min."""
+        """Remove sessions inactive for more than SESSION_TTL. Runs every 5 min."""
         logger.info("Session reaper started (TTL=%dh)", SESSION_TTL // 3600)
         while True:
             await asyncio.sleep(REAPER_INTERVAL)
@@ -393,7 +391,7 @@ class SessionManager:
                 session.session_name,
                 (now - session.last_activity) / 3600,
             )
-            await self.kill_session(session)
+            self.kill_session(session)
             del self._sessions[session.session_id]
             key = (session.user_id, session.session_name)
             if self._name_index.get(key) == session.session_id:
